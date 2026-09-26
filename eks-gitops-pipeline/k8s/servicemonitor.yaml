@@ -1,0 +1,19 @@
+# Requires the kube-prometheus-stack Prometheus Operator installed on the cluster.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: devops-demo-app
+  namespace: demo
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: devops-demo-app
+  namespaceSelector:
+    matchNames:
+      - demo
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s

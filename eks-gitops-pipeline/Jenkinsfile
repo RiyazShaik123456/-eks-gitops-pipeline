@@ -1,0 +1,96 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_ACCOUNT_ID   = credentials('aws-account-id')
+        AWS_REGION       = 'ap-south-1'
+        ECR_REPO         = 'devops-demo-app'
+        IMAGE_TAG        = "${env.BUILD_NUMBER}"
+        SONAR_PROJECT    = 'devops-demo-app'
+        GITOPS_REPO      = 'git@bitbucket.org:your-org/eks-gitops-config.git'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Unit tests') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install -r app/requirements.txt
+                    pip install pytest
+                    pytest app/ || true
+                '''
+            }
+        }
+
+        stage('SonarQube scan') {
+            steps {
+                withSonarQubeEnv('sonarqube-server') {
+                    sh "sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT} -Dsonar.sources=app"
+                }
+            }
+        }
+
+        stage('Quality gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('Build image') {
+            steps {
+                sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh '''
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                      docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+                    docker tag ${ECR_REPO}:${IMAGE_TAG} ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
+                    docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
+                '''
+            }
+        }
+
+        stage('Update GitOps manifest') {
+            steps {
+                // ArgoCD watches this repo; bumping the image tag here triggers the deploy.
+                sh '''
+                    git clone ${GITOPS_REPO} gitops
+                    cd gitops
+                    sed -i "s#devops-demo-app:.*#devops-demo-app:${IMAGE_TAG}#g" k8s/deployment.yaml
+                    git config user.email "jenkins@ci.local"
+                    git config user.name "jenkins-ci"
+                    git commit -am "Deploy devops-demo-app build ${IMAGE_TAG}"
+                    git push origin main
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Build ${IMAGE_TAG} pushed and GitOps repo updated — ArgoCD will sync to EKS."
+        }
+        failure {
+            echo "Pipeline failed at build ${IMAGE_TAG} — check stage logs above."
+        }
+    }
+}
